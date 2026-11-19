@@ -106,6 +106,7 @@ export function createSfu({ send, iceServers, onStream, onStreamGone, onState })
     setQuality,
     unpublish,
     close,
+    videoSenders: () => up?.getSenders().filter((sender) => sender.track?.kind === 'video') ?? [],
     get state() {
       return down?.connectionState ?? 'new';
     },
