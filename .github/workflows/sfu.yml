@@ -1,0 +1,47 @@
+name: sfu
+
+on:
+  push:
+    branches: [main]
+    paths: ['sfu/**', '.github/workflows/sfu.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './sfu -> target'
+      - run: cargo build --release --locked
+        working-directory: sfu
+      - run: cp sfu/target/release/sfu telinha-sfu-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: telinha-sfu-${{ matrix.arch }}
+          path: telinha-sfu-${{ matrix.arch }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view sfu >/dev/null 2>&1 || gh release create sfu --title "Servidor de vídeo (SFU)" --notes "Binários do servidor de mídia. Não é o app." --latest=false
+          gh release upload sfu telinha-sfu-x86_64 telinha-sfu-aarch64 --clobber

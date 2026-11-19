@@ -1,4 +1,5 @@
 import { initReactions, showReaction } from './reactions.js';
+import { createSfu } from './sfu.js';
 import { isNative, listAudioApps, startNativeAudio, bindWindowControls, appVersion, checkUpdate, installUpdate } from './native.js';
 
 const SERVER = window.TELINHA_SERVER ?? 'https://telinha-xp0y.onrender.com';
@@ -34,6 +35,8 @@ const randomId = () => {
 const peers = new Map();
 let ws = null;
 let iceServers = [];
+let mode = 'p2p';
+let sfu = null;
 let myId = null;
 let myName = '';
 let roomId = '';
@@ -124,7 +127,7 @@ async function join() {
     toast('Desconectado do servidor. Saia e entre de novo.', 8000);
   });
 
-  send({ t: 'join', room: roomId, name: myName, state: myState() });
+  send({ t: 'join', room: roomId, name: myName, state: myState(), sfu: typeof RTCRtpSender !== 'undefined' });
 }
 
 function send(msg) {
@@ -143,6 +146,8 @@ function onServerMessage(msg) {
   switch (msg.t) {
     case 'welcome':
       myId = msg.id;
+      mode = msg.mode === 'sfu' ? 'sfu' : 'p2p';
+      if (mode === 'sfu') startSfu();
       enterRoom();
       for (const info of msg.peers) createPeer(info);
       updateCounters();
@@ -164,16 +169,22 @@ function onServerMessage(msg) {
       if (!peer) break;
       const prevScreen = peer.state.screen;
       peer.state = msg.state;
-      if (prevScreen && prevScreen !== msg.state.screen) removeRemoteTile(peer);
+      if (mode === 'p2p' && prevScreen && prevScreen !== msg.state.screen) removeRemoteTile(peer);
       renderPeople();
       break;
     }
     case 'signal': {
       const peer = peers.get(msg.from);
-      if (!peer) break;
+      if (!peer?.pc) break;
       peer.queue = peer.queue.then(() => handleSignal(peer, msg.data)).catch((err) => console.warn(err));
       break;
     }
+    case 'sfu':
+      sfu?.handle(msg);
+      break;
+    case 'mode':
+      if (msg.mode === 'p2p' && mode === 'sfu') switchToP2p();
+      break;
     case 'react':
       showReaction(msg.name, msg.r);
       break;
@@ -194,12 +205,11 @@ function enterRoom() {
 }
 
 function createPeer(info) {
-  const pc = new RTCPeerConnection({ iceServers });
   const peer = {
     id: info.id,
     name: info.name,
     state: info.state,
-    pc,
+    pc: null,
     polite: myId > info.id,
     makingOffer: false,
     ignoreOffer: false,
@@ -208,6 +218,47 @@ function createPeer(info) {
     tile: null,
   };
   peers.set(peer.id, peer);
+  if (mode === 'p2p') attachPc(peer);
+  else if (sfuStreams.has(peer.id)) showRemoteTile(peer, sfuStreams.get(peer.id));
+  return peer;
+}
+
+const sfuStreams = new Map();
+
+function startSfu() {
+  sfu = createSfu({
+    send,
+    iceServers,
+    onStream(owner, stream) {
+      sfuStreams.set(owner, stream);
+      const peer = peers.get(owner);
+      if (peer) showRemoteTile(peer, stream);
+    },
+    onStreamGone(owner) {
+      sfuStreams.delete(owner);
+      const peer = peers.get(owner);
+      if (peer) removeRemoteTile(peer);
+    },
+    onState() {
+      for (const peer of peers.values()) updateTileStatus(peer);
+    },
+  });
+}
+
+function switchToP2p() {
+  mode = 'p2p';
+  sfu?.close();
+  sfu = null;
+  sfuStreams.clear();
+  for (const peer of peers.values()) {
+    removeRemoteTile(peer);
+    attachPc(peer);
+  }
+}
+
+function attachPc(peer) {
+  const pc = new RTCPeerConnection({ iceServers });
+  peer.pc = pc;
 
   pc.onnegotiationneeded = async () => {
     try {
@@ -235,7 +286,6 @@ function createPeer(info) {
   };
 
   if (screenStream) addScreenTo(peer);
-  return peer;
 }
 
 async function handleSignal(peer, { description, candidate }) {
@@ -261,7 +311,7 @@ async function handleSignal(peer, { description, candidate }) {
 function removePeer(id) {
   const peer = peers.get(id);
   if (!peer) return;
-  peer.pc.close();
+  peer.pc?.close();
   removeRemoteTile(peer);
   peers.delete(id);
 }
@@ -272,7 +322,7 @@ function showRemoteTile(peer, stream) {
   peer.tile = makeTile(peer.name, stream, false);
   updateTileStatus(peer);
   setTimeout(() => {
-    if (peer.tile?.stream === stream && peer.pc.connectionState !== 'connected') {
+    if (peer.tile?.stream === stream && (peer.pc?.connectionState ?? sfu?.state) !== 'connected') {
       peer.tile.status.textContent = 'Sem conexão. Desligue VPN/proxy e tente de novo.';
     }
   }, 15_000);
@@ -283,7 +333,7 @@ function showRemoteTile(peer, stream) {
 
 function updateTileStatus(peer) {
   if (!peer.tile) return;
-  const state = peer.pc.connectionState;
+  const state = peer.pc ? peer.pc.connectionState : sfu?.state ?? 'new';
   const { status, statusText } = peer.tile;
   status.hidden = state === 'connected';
   status.classList.toggle('failed', state === 'failed');
@@ -567,6 +617,8 @@ async function startShare() {
   displayStream = display;
   screenStream = new MediaStream([video, ...audioTracks]);
   send({ t: 'state', state: myState() });
+  await hardwareCodecPrefs();
+  if (sfu) await sfu.publish(screenStream, QUALITIES[qualityKey], codecPrefs);
   for (const peer of peers.values()) addScreenTo(peer);
 
   localTile = makeTile(myName, screenStream, true);
@@ -576,15 +628,44 @@ async function startShare() {
 }
 
 function addScreenTo(peer) {
-  if (!screenStream) return;
+  if (!screenStream || !peer.pc) return;
   const q = QUALITIES[qualityKey];
-  peer.screenTx = screenStream.getTracks().map((track) =>
-    peer.pc.addTransceiver(track, {
+  peer.screenTx = screenStream.getTracks().map((track) => {
+    const tx = peer.pc.addTransceiver(track, {
       direction: 'sendonly',
       streams: [screenStream],
       ...(track.kind === 'video' && { sendEncodings: [{ maxBitrate: q.bitrate, maxFramerate: q.fps }] }),
-    }),
-  );
+    });
+    if (track.kind === 'video' && codecPrefs?.length) {
+      try { tx.setCodecPreferences(codecPrefs); } catch {}
+    }
+    return tx;
+  });
+}
+
+let codecPrefs = null;
+
+async function hardwareCodecPrefs() {
+  if (codecPrefs) return codecPrefs;
+  const caps = globalThis.RTCRtpSender?.getCapabilities?.('video')?.codecs ?? [];
+  const efficient = new Set();
+  for (const mime of ['video/H264', 'video/AV1', 'video/VP9']) {
+    try {
+      const info = await navigator.mediaCapabilities.encodingInfo({
+        type: 'webrtc',
+        video: { contentType: mime, width: 1920, height: 1080, bitrate: 8_000_000, framerate: 60 },
+      });
+      if (info.supported && info.powerEfficient) efficient.add(mime);
+    } catch {}
+  }
+  const rank = ({ mimeType: m, sdpFmtpLine: f = '' }) => {
+    const base = efficient.has(m) ? 0 : 10;
+    const order = { 'video/H264': 0, 'video/AV1': 1, 'video/VP9': 2, 'video/VP8': 3 }[m] ?? 50;
+    const h264Mode = m === 'video/H264' && !f.includes('packetization-mode=1') ? 0.5 : 0;
+    return (order === 50 ? 100 : base + order) + h264Mode;
+  };
+  codecPrefs = caps.map((c, i) => ({ c, i })).sort((a, b) => rank(a.c) - rank(b.c) || a.i - b.i).map(({ c }) => c);
+  return codecPrefs;
 }
 
 function stopShare() {
@@ -600,6 +681,7 @@ function stopShare() {
     }
     peer.screenTx = [];
   }
+  sfu?.unpublish();
   screenStream = null;
   send({ t: 'state', state: myState() });
   if (localTile) destroyTile(localTile);
@@ -615,6 +697,7 @@ async function applyQuality() {
   const q = QUALITIES[qualityKey];
   const [video] = screenStream.getVideoTracks();
   await video?.applyConstraints({ frameRate: { ideal: q.fps, max: q.fps }, height: { ideal: q.height, max: q.height } }).catch(() => {});
+  await sfu?.setQuality(q);
   for (const peer of peers.values()) {
     for (const tx of peer.screenTx) {
       if (tx.sender.track?.kind !== 'video') continue;
@@ -823,3 +906,5 @@ function confirmLeave() {
   toast('Pare de transmitir antes de atualizar.', 3500);
   return false;
 }
+
+hardwareCodecPrefs();
