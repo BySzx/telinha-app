@@ -660,3 +660,39 @@ body:not(.in-room) .toast { bottom: 24px; }
 .share-stats .ok::before, .share-stats .warn::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
 .share-stats .warn { color: #ff9b52; }
 .share-stats .warn::before { background: #ff9b52; }
+
+.copy-room {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  margin-left: -2px;
+  border-radius: 7px;
+  color: rgba(255, 255, 255, .5);
+  transition: transform .3s var(--jelly), background .2s, color .2s;
+}
+.copy-room svg { width: 13px; height: 13px; grid-area: 1 / 1; transition: transform .35s var(--jelly), opacity .2s; }
+.copy-room .ic-ok { opacity: 0; transform: scale(.4); color: var(--green); stroke-width: 2.6; }
+.copy-room:hover { background: rgba(255, 255, 255, .1); color: #fff; }
+.copy-room:active { transform: scale(.85); }
+.copy-room.copied .ic-copy { opacity: 0; transform: scale(.4); }
+.copy-room.copied .ic-ok { opacity: 1; transform: none; }
+
+.option.check .box {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, .28);
+  transition: background .2s, box-shadow .2s, transform .3s var(--jelly);
+}
+.option.check .box svg { width: 13px; height: 13px; stroke-width: 3; color: #0b0b0d; opacity: 0; transform: scale(.4); transition: opacity .15s, transform .3s var(--jelly); }
+.option.check.selected .box { background: #fff; box-shadow: none; }
+.option.check.selected .box svg { opacity: 1; transform: none; }
+.option.check.removed .box { background: var(--red); }
+.option.check.removed .box svg { color: #fff; }
+.option.check.removed .label b { text-decoration: line-through; text-decoration-color: rgba(255, 95, 109, .7); color: rgba(255, 255, 255, .6); }
+.option.check.removed .label small { color: var(--red); }
+.options-empty { padding: 6px 4px; font-size: 12.5px; color: rgba(255, 255, 255, .45); }
