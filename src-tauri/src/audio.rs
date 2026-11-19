@@ -20,11 +20,16 @@ pub struct AudioApp {
     pub active: bool,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AudioSource {
-    System,
-    App { pid: u32 },
+    System {
+        #[serde(default)]
+        exclude: Vec<u32>,
+        #[serde(default, rename = "excludeNames")]
+        exclude_names: Vec<String>,
+    },
+    Apps { pids: Vec<u32> },
 }
 
 #[derive(Default)]
@@ -53,16 +58,11 @@ pub fn start_audio(source: AudioSource, on_data: Channel, state: State<'_, Audio
     let stop = Arc::new(AtomicBool::new(false));
     *state.stop.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop.clone());
 
-    let (target_pid, include_tree) = match source {
-        AudioSource::System => (std::process::id(), false),
-        AudioSource::App { pid } => (pid, true),
-    };
-
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     std::thread::Builder::new()
         .name("telinha-audio".into())
         .spawn(move || {
-            platform::capture(target_pid, include_tree, &stop, ready_tx, |bytes| {
+            platform::capture(source, &stop, ready_tx, move |bytes| {
                 on_data.send(InvokeResponseBody::Raw(bytes)).is_ok()
             });
         })
@@ -81,10 +81,12 @@ pub fn stop_audio(state: State<'_, AudioState>) {
 
 #[cfg(windows)]
 mod platform {
-    use super::{AudioApp, CHANNELS, CHUNK_FRAMES, SAMPLE_RATE};
+    use super::{AudioApp, AudioSource, CHANNELS, CHUNK_FRAMES, SAMPLE_RATE};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::Sender;
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
     use wasapi::{initialize_mta, AudioClient, Direction, SampleType, StreamMode, WaveFormat};
     use windows::core::Interface;
     use windows::Win32::Foundation::CloseHandle;
@@ -168,7 +170,7 @@ mod platform {
         }
     }
 
-    pub fn list_apps() -> Result<Vec<AudioApp>, String> {
+    fn session_pids() -> Result<Vec<(u32, bool)>, String> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let result = (|| -> windows::core::Result<Vec<(u32, bool)>> {
@@ -187,38 +189,55 @@ mod platform {
                 }
                 Ok(out)
             })();
-            let sessions = result.map_err(|e| e.to_string())?;
-
-            let table = process_table();
-            let own = std::process::id();
-            let mut apps: HashMap<u32, AudioApp> = HashMap::new();
-            for (pid, active) in sessions {
-                if descends_from(pid, own, &table) {
-                    continue;
-                }
-                let root = tree_root(pid, &table);
-                let name = table.get(&root).map(|p| display_name(&p.exe)).unwrap_or_else(|| format!("PID {root}"));
-                apps.entry(root)
-                    .and_modify(|app| app.active |= active)
-                    .or_insert(AudioApp { pid: root, name, active });
-            }
-            let mut list: Vec<AudioApp> = apps.into_values().collect();
-            list.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-            Ok(list)
+            result.map_err(|e| e.to_string())
         }
     }
 
-    pub fn capture(
-        target_pid: u32,
-        include_tree: bool,
-        stop: &AtomicBool,
-        ready: Sender<Result<(), String>>,
-        mut emit: impl FnMut(Vec<u8>) -> bool,
-    ) {
+    pub fn list_apps() -> Result<Vec<AudioApp>, String> {
+        let sessions = session_pids()?;
+        let table = process_table();
+        let own = std::process::id();
+        let mut apps: HashMap<u32, AudioApp> = HashMap::new();
+        for (pid, active) in sessions {
+            if descends_from(pid, own, &table) {
+                continue;
+            }
+            let root = tree_root(pid, &table);
+            let name = table.get(&root).map(|p| display_name(&p.exe)).unwrap_or_else(|| format!("PID {root}"));
+            apps.entry(root)
+                .and_modify(|app| app.active |= active)
+                .or_insert(AudioApp { pid: root, name, active });
+        }
+        let mut list: Vec<AudioApp> = apps.into_values().collect();
+        list.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        Ok(list)
+    }
+
+    struct Source {
+        buf: VecDeque<f32>,
+        last: Instant,
+    }
+
+    #[derive(Default)]
+    struct Mixer {
+        sources: Mutex<HashMap<u32, Source>>,
+        wake: Condvar,
+    }
+
+    impl Mixer {
+        fn push(&self, id: u32, samples: impl Iterator<Item = f32>) {
+            let mut sources = self.sources.lock().unwrap_or_else(|e| e.into_inner());
+            let src = sources.entry(id).or_insert_with(|| Source { buf: VecDeque::new(), last: Instant::now() });
+            src.buf.extend(samples);
+            src.last = Instant::now();
+            drop(sources);
+            self.wake.notify_one();
+        }
+    }
+
+    fn capture_one(id: u32, target_pid: u32, include_tree: bool, stop: Arc<AtomicBool>, mixer: Arc<Mixer>, ready: Sender<Result<(), String>>) {
         let _ = initialize_mta();
         let format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
-        let block_align = format.get_blockalign() as usize;
-        let chunk_bytes = CHUNK_FRAMES * block_align;
 
         let setup = (|| -> Result<_, Box<dyn std::error::Error>> {
             let mut client = AudioClient::new_application_loopback_client(target_pid, include_tree)?;
@@ -244,7 +263,7 @@ mod platform {
             }
         };
 
-        let mut queue: VecDeque<u8> = VecDeque::with_capacity(chunk_bytes * 8);
+        let mut bytes: VecDeque<u8> = VecDeque::with_capacity(CHUNK_FRAMES * CHANNELS * 4 * 8);
         while !stop.load(Ordering::Relaxed) {
             if event.wait_for_event(100).is_err() {
                 continue;
@@ -252,10 +271,10 @@ mod platform {
             loop {
                 match capture.get_next_packet_size() {
                     Ok(Some(frames)) if frames > 0 => {
-                        let before = queue.len();
-                        match capture.read_from_device_to_deque(&mut queue) {
+                        let before = bytes.len();
+                        match capture.read_from_device_to_deque(&mut bytes) {
                             Ok(info) if info.flags.silent => {
-                                for byte in queue.iter_mut().skip(before) {
+                                for byte in bytes.iter_mut().skip(before) {
                                     *byte = 0;
                                 }
                             }
@@ -266,32 +285,164 @@ mod platform {
                     _ => break,
                 }
             }
-            while queue.len() >= chunk_bytes {
-                let chunk: Vec<u8> = queue.drain(..chunk_bytes).collect();
-                if !emit(chunk) {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
+            let whole = bytes.len() / 4 * 4;
+            if whole > 0 {
+                let raw: Vec<u8> = bytes.drain(..whole).collect();
+                mixer.push(id, raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
             }
         }
         let _ = client.stop_stream();
+    }
+
+    fn spawn_source(id: u32, pid: u32, include_tree: bool, stop: &Arc<AtomicBool>, mixer: &Arc<Mixer>) -> mpsc::Receiver<Result<(), String>> {
+        let (tx, rx) = mpsc::channel();
+        let stop = stop.clone();
+        let mixer = mixer.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("telinha-audio-{pid}"))
+            .spawn(move || capture_one(id, pid, include_tree, stop, mixer, tx.clone()));
+        if let Err(err) = spawned {
+            let (etx, erx) = mpsc::channel();
+            let _ = etx.send(Err(err.to_string()));
+            return erx;
+        }
+        rx
+    }
+
+    fn mix_loop(stop: &AtomicBool, mixer: &Mixer, mut emit: impl FnMut(Vec<u8>) -> bool) {
+        let need = CHUNK_FRAMES * CHANNELS;
+        let backlog = need * 6;
+        let mut last_emit = Instant::now();
+        while !stop.load(Ordering::Relaxed) {
+            let guard = mixer.sources.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut sources, _) = mixer
+                .wake
+                .wait_timeout(guard, Duration::from_millis(5))
+                .unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let mut any = false;
+            let mut all_ready = true;
+            let mut active = 0;
+            for src in sources.values() {
+                if !src.buf.is_empty() {
+                    any = true;
+                }
+                if now.duration_since(src.last) < Duration::from_millis(80) {
+                    active += 1;
+                    if src.buf.len() < need {
+                        all_ready = false;
+                    }
+                }
+            }
+            let ready = active > 0 && all_ready;
+            let late = any && now.duration_since(last_emit) >= Duration::from_millis(30);
+            if !ready && !late {
+                continue;
+            }
+            let mut out = vec![0f32; need];
+            for src in sources.values_mut() {
+                if src.buf.len() > backlog {
+                    let excess = (src.buf.len() - backlog) / CHANNELS * CHANNELS;
+                    src.buf.drain(..excess);
+                }
+                let n = need.min(src.buf.len());
+                for (slot, sample) in out.iter_mut().zip(src.buf.drain(..n)) {
+                    *slot += sample;
+                }
+            }
+            drop(sources);
+            last_emit = now;
+            let mut chunk = Vec::with_capacity(need * 4);
+            for sample in out {
+                chunk.extend_from_slice(&sample.clamp(-1.0, 1.0).to_le_bytes());
+            }
+            if !emit(chunk) {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn capture(source: AudioSource, stop: &Arc<AtomicBool>, ready: Sender<Result<(), String>>, emit: impl FnMut(Vec<u8>) -> bool) {
+        let mixer = Arc::new(Mixer::default());
+        let own = std::process::id();
+        match source {
+            AudioSource::System { exclude, exclude_names } if exclude.is_empty() && exclude_names.is_empty() => {
+                let rx = spawn_source(own, own, false, stop, &mixer);
+                let result = rx.recv_timeout(Duration::from_secs(4)).unwrap_or_else(|_| Err("tempo esgotado".into()));
+                let failed = result.is_err();
+                let _ = ready.send(result);
+                if failed {
+                    return;
+                }
+            }
+            AudioSource::Apps { pids } => {
+                let receivers: Vec<_> = pids.iter().map(|&pid| spawn_source(pid, pid, true, stop, &mixer)).collect();
+                let results: Vec<_> = receivers
+                    .iter()
+                    .map(|rx| rx.recv_timeout(Duration::from_secs(4)).unwrap_or_else(|_| Err("tempo esgotado".into())))
+                    .collect();
+                if !results.is_empty() && results.iter().all(|r| r.is_err()) {
+                    let _ = ready.send(results.into_iter().next().unwrap());
+                    return;
+                }
+                let _ = ready.send(Ok(()));
+            }
+            AudioSource::System { exclude, exclude_names } => {
+                let excluded: HashSet<u32> = exclude.into_iter().collect();
+                let excluded_names: HashSet<String> = exclude_names.into_iter().map(|n| n.to_lowercase()).collect();
+                let _ = ready.send(Ok(()));
+                let scan_stop = stop.clone();
+                let scan_mixer = mixer.clone();
+                let _ = std::thread::Builder::new().name("telinha-audio-scan".into()).spawn(move || {
+                    let mut started: HashSet<u32> = HashSet::new();
+                    while !scan_stop.load(Ordering::Relaxed) {
+                        if let Ok(sessions) = session_pids() {
+                            let table = process_table();
+                            for (pid, _) in sessions {
+                                if descends_from(pid, own, &table) {
+                                    continue;
+                                }
+                                let root = tree_root(pid, &table);
+                                let name = table.get(&root).map(|p| display_name(&p.exe).to_lowercase()).unwrap_or_default();
+                                if excluded.contains(&root)
+                                    || excluded_names.contains(&name)
+                                    || excluded.iter().any(|&x| descends_from(pid, x, &table))
+                                {
+                                    continue;
+                                }
+                                if started.insert(root) {
+                                    let _ = spawn_source(root, root, true, &scan_stop, &scan_mixer);
+                                }
+                            }
+                        }
+                        for _ in 0..20 {
+                            if scan_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                });
+            }
+        }
+        mix_loop(stop, &mixer, emit);
     }
 }
 
 #[cfg(not(windows))]
 mod platform {
-    use super::AudioApp;
+    use super::{AudioApp, AudioSource};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::Sender;
+    use std::sync::Arc;
 
     pub fn list_apps() -> Result<Vec<AudioApp>, String> {
         Ok(Vec::new())
     }
 
     pub fn capture(
-        _target_pid: u32,
-        _include_tree: bool,
-        _stop: &AtomicBool,
+        _source: AudioSource,
+        _stop: &Arc<AtomicBool>,
         ready: Sender<Result<(), String>>,
         _emit: impl FnMut(Vec<u8>) -> bool,
     ) {
