@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telinha</title>
+  <link rel="preload" href="fonts/inter.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="glow" aria-hidden="true"></div>
+
+  <header class="header" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
+      <span class="eyes eyes-look" style="--ew:5px;--eh:8px;--eg:5px;--ec:#f5f5f6;--amp:1.5px"><span class="eyes-in"><i class="eye"></i><i class="eye"></i></span></span>
+      <span class="label" data-tauri-drag-region>TELINHA</span>
+      <span class="room-info" data-tauri-drag-region>
+        <span class="sep"></span>
+        <span class="live-dot"></span>
+        <span class="label">SALA</span>
+        <strong id="roomLabel" class="mono"></strong>
+      </span>
+    </div>
+    <div class="win">
+      <button type="button" id="updateBtn" class="update-pill" hidden>
+        <span class="eyes" style="--ew:4px;--eh:6px;--eg:4px;--ec:#47e08a;--amp:1px"><span class="eyes-in"><i class="eye"></i><i class="eye"></i></span></span>
+        <span id="updateLabel">Atualizar</span>
+      </button>
+      <button type="button" class="win-btn" data-win="minimize" title="Minimizar"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+      <button type="button" class="win-btn" data-win="maximize" title="Maximizar"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="3"/></svg></button>
+      <button type="button" class="win-btn close" data-win="close" title="Fechar"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+  </header>
+
+  <main id="lobby" class="lobby v-in">
+    <form id="lobbyForm" class="lobby-col" autocomplete="off">
+      <span class="eyes eyes-look hero-eyes" style="--ew:16px;--eh:26px;--eg:16px;--ec:#f5f5f6;--amp:5px"><span class="eyes-in"><i class="eye"></i><i class="eye"></i></span></span>
+      <h1>Bora ver a tela<br><span class="dim">da galera.</span></h1>
+
+      <label class="field">
+        <span class="label">SEU NOME</span>
+        <input id="name" class="input" maxlength="32" placeholder="Como te chamam?">
+      </label>
+
+      <button type="button" id="createRoom" class="btn btn-white wide">Criar sala</button>
+
+      <div class="divider"><span class="label">OU ENTRE NUMA SALA</span></div>
+
+      <div class="join-row">
+        <input id="roomInput" class="input" placeholder="Código ou link da sala">
+        <button type="submit" class="btn btn-dark">Entrar</button>
+      </div>
+      <p id="lobbyError" class="error"></p>
+    </form>
+    <span id="version" class="version mono"></span>
+  </main>
+
+  <main id="room" class="room" hidden>
+    <section id="stage" class="stage">
+      <div id="emptyStage" class="empty v-in">
+        <span class="eyes eyes-look" style="--ew:14px;--eh:22px;--eg:14px;--ec:#f5f5f6;--amp:4px"><span class="eyes-in"><i class="eye"></i><i class="eye"></i></span></span>
+        <p>Ninguém transmitindo</p>
+        <span>Clique em <b>Compartilhar tela</b> pra começar</span>
+      </div>
+    </section>
+
+    <nav class="dock">
+      <div class="pop-wrap">
+        <button type="button" id="viewers" class="dock-item" aria-expanded="false" title="Pessoas na sala">
+          <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span id="peopleCount" class="mono count">1/10</span>
+          <span class="dock-label">PESSOAS</span>
+        </button>
+        <ul id="peopleList" class="pop people-list" hidden></ul>
+      </div>
+      <div class="pop-wrap">
+        <button type="button" id="reactBtn" class="dock-item" aria-expanded="false" title="Reagir">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></svg>
+          <span class="dock-label">REAGIR</span>
+        </button>
+        <div id="reactPicker" class="pop react-picker" hidden></div>
+      </div>
+      <button type="button" id="copyLink" class="dock-item" title="Copiar link">
+        <svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        <span class="dock-label">COPIAR LINK</span>
+      </button>
+
+      <span class="dock-sep"></span>
+
+      <button type="button" id="share" class="btn btn-white share-btn">
+        <svg class="ic-start" viewBox="0 0 24 24"><path d="m9 10 3-3 3 3M12 13V7"/><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M12 17v4M8 21h8"/></svg>
+        <svg class="ic-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>
+        <span id="shareLabel">Compartilhar tela</span>
+      </button>
+      <button type="button" id="leave" class="dock-item danger" title="Sair da sala">
+        <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+      </button>
+    </nav>
+  </main>
+
+  <div id="sheetBackdrop" class="backdrop" hidden>
+    <form id="shareSheet" class="sheet">
+      <div class="sheet-head">
+        <span class="eyes eyes-busy" style="--ew:6px;--eh:9px;--eg:6px;--ec:#7cc4ff;--amp:2px"><span class="eyes-in"><i class="eye"></i><i class="eye"></i></span></span>
+        <h2>Compartilhar tela</h2>
+      </div>
+
+      <section>
+        <span class="label">QUALIDADE</span>
+        <div id="qualityChips" class="chips"></div>
+        <p id="uploadHint" class="hint"></p>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <span class="label">ÁUDIO</span>
+          <button type="button" id="refreshApps" class="pill-sm" hidden>
+            <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8M21 3v5h-5M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16M8 16H3v5"/></svg>
+            Atualizar
+          </button>
+        </div>
+        <div id="audioOptions" class="options"></div>
+      </section>
+
+      <div class="sheet-actions">
+        <button type="button" id="cancelShare" class="btn btn-dark">Cancelar</button>
+        <button type="submit" class="btn btn-white">Escolher tela</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
