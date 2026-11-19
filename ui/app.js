@@ -622,6 +622,7 @@ async function startShare() {
   for (const peer of peers.values()) addScreenTo(peer);
 
   localTile = makeTile(myName, screenStream, true);
+  startShareStats(localTile);
   $('#shareLabel').textContent = 'Parar';
   $('#share').classList.add('active');
   updateCounters();
@@ -643,6 +644,81 @@ function addScreenTo(peer) {
   });
 }
 
+let codecEfficient = new Set();
+let statsTimer = 0;
+let lastBytes = 0;
+let lastStatsAt = 0;
+
+const CODEC_NAMES = { 'video/H264': 'H.264', 'video/AV1': 'AV1', 'video/VP9': 'VP9', 'video/VP8': 'VP8' };
+const LIMITS = { cpu: 'processador no limite', bandwidth: 'internet no limite' };
+
+function videoSenders() {
+  const list = [...peers.values()].flatMap((p) => p.screenTx.map((tx) => tx.sender));
+  return [...list, ...(sfu?.videoSenders() ?? [])].filter((s) => s.track?.kind === 'video');
+}
+
+function startShareStats(tile) {
+  const box = document.createElement('div');
+  box.className = 'share-stats';
+  tile.el.append(box);
+  lastBytes = 0;
+  lastStatsAt = 0;
+  clearInterval(statsTimer);
+  const tick = async () => {
+    if (!screenStream || !box.isConnected) return clearInterval(statsTimer);
+    const reports = await Promise.all(videoSenders().map((s) => s.getStats().catch(() => null)));
+    let codec = '';
+    let hw = null;
+    let fps = Infinity;
+    let height = 0;
+    let bytes = 0;
+    let limit = '';
+    let streams = 0;
+    for (const report of reports) {
+      report?.forEach((st) => {
+        if (st.type !== 'outbound-rtp' || st.kind !== 'video') return;
+        streams++;
+        bytes += st.bytesSent ?? 0;
+        if (st.framesPerSecond != null) fps = Math.min(fps, st.framesPerSecond);
+        height = Math.max(height, st.frameHeight ?? 0);
+        if (st.qualityLimitationReason && st.qualityLimitationReason !== 'none') limit = st.qualityLimitationReason;
+        const c = report.get(st.codecId);
+        if (c) codec = c.mimeType;
+        if (st.powerEfficientEncoder != null) hw = st.powerEfficientEncoder;
+        else if (/MediaFoundation|Nvenc|Amf|Qsv|VideoToolbox|VAAPI|V4L2/i.test(st.encoderImplementation ?? '')) hw = true;
+      });
+    }
+    const now = performance.now();
+    const mbps = lastStatsAt ? ((bytes - lastBytes) * 8) / ((now - lastStatsAt) * 1000) : 0;
+    lastBytes = bytes;
+    lastStatsAt = now;
+    if (hw === null && codec) hw = codecEfficient.has(codec);
+    const viewers = peers.size;
+    const chips = [];
+    if (!streams) {
+      chips.push(['', viewers ? 'Conectando…' : 'Ninguém assistindo ainda']);
+    } else {
+      chips.push(['', CODEC_NAMES[codec] ?? codec.replace('video/', '')]);
+      chips.push([hw ? 'ok' : 'warn', hw ? 'placa de vídeo' : 'processador']);
+      if (Number.isFinite(fps)) chips.push([fps < (QUALITIES[qualityKey].fps * 0.75) ? 'warn' : '', `${Math.round(fps)} fps`]);
+      if (height) chips.push(['', `${height}p`]);
+      if (mbps > 0) chips.push(['', `${mbps.toFixed(1)} Mbps`]);
+      chips.push(['', `${viewers} assistindo`]);
+      if (limit) chips.push(['warn', LIMITS[limit] ?? limit]);
+    }
+    box.replaceChildren(
+      ...chips.map(([cls, text]) => {
+        const span = document.createElement('span');
+        if (cls) span.className = cls;
+        span.textContent = text;
+        return span;
+      }),
+    );
+  };
+  statsTimer = setInterval(tick, 1000);
+  tick();
+}
+
 let codecPrefs = null;
 
 async function hardwareCodecPrefs() {
@@ -658,6 +734,7 @@ async function hardwareCodecPrefs() {
       if (info.supported && info.powerEfficient) efficient.add(mime);
     } catch {}
   }
+  codecEfficient = efficient;
   const rank = ({ mimeType: m, sdpFmtpLine: f = '' }) => {
     const base = efficient.has(m) ? 0 : 10;
     const order = { 'video/H264': 0, 'video/AV1': 1, 'video/VP9': 2, 'video/VP8': 3 }[m] ?? 50;
@@ -684,6 +761,7 @@ function stopShare() {
   sfu?.unpublish();
   screenStream = null;
   send({ t: 'state', state: myState() });
+  clearInterval(statsTimer);
   if (localTile) destroyTile(localTile);
   localTile = null;
   $('#shareLabel').textContent = 'Compartilhar tela';
