@@ -46,7 +46,13 @@ let nativeAudio = null;
 let localTile = null;
 let focusedTile = null;
 let qualityKey = (storage.get('quality') ?? '') in QUALITIES ? storage.get('quality') : '1080p30';
-let audioChoice = { kind: isNative ? 'system' : 'browser' };
+const readList = (key) => {
+  try { return new Set(JSON.parse(storage.get(key) ?? '[]')); } catch { return new Set(); }
+};
+const savedMode = storage.get('audioMode');
+let audioChoice = { kind: isNative ? (['system', 'apps', 'none'].includes(savedMode) ? savedMode : 'system') : 'browser' };
+const excludedNames = readList('audioExclude');
+const includedNames = readList('audioInclude');
 let audioApps = [];
 let toastTimer = 0;
 
@@ -199,6 +205,7 @@ function enterRoom() {
   $('#lobby').hidden = true;
   $('#room').hidden = false;
   $('#roomLabel').textContent = roomId;
+  $('#copyRoom').hidden = false;
   document.body.classList.add('in-room');
   startTintLoop();
   initReactions((r) => send({ t: 'react', r }));
@@ -501,42 +508,91 @@ function audioOption({ key, title, subtitle, mono = false, badge, choice }) {
   label.addEventListener('click', (ev) => {
     ev.preventDefault();
     audioChoice = choice;
+    if (isNative) storage.set('audioMode', choice.kind);
     renderAudioOptions();
   });
   return label;
+}
+
+function appCheck(app, list, removing) {
+  const checked = list.has(app.name);
+  const label = document.createElement('label');
+  label.className = `option check${checked ? ' selected' : ''}${checked && removing ? ' removed' : ''}`;
+  const box = document.createElement('span');
+  box.className = 'box';
+  box.innerHTML = '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+  const text = document.createElement('span');
+  text.className = 'label';
+  const b = document.createElement('b');
+  b.textContent = app.name;
+  const small = document.createElement('small');
+  small.className = 'mono';
+  small.textContent = checked && removing ? 'fora da transmissão' : `PID ${app.pid}`;
+  text.append(b, small);
+  label.append(box, text);
+  if (app.active) {
+    const tag = document.createElement('span');
+    tag.className = 'badge';
+    tag.textContent = 'TOCANDO';
+    label.append(tag);
+  }
+  label.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    if (checked) list.delete(app.name);
+    else list.add(app.name);
+    storage.set(removing ? 'audioExclude' : 'audioInclude', JSON.stringify([...list]));
+    renderAudioOptions();
+  });
+  return label;
+}
+
+function chosenApps() {
+  return audioApps.filter((a) => includedNames.has(a.name));
 }
 
 function renderAudioOptions() {
   const box = $('#audioOptions');
   const items = [];
   if (isNative) {
-    items.push(audioOption({ key: 'system', title: 'Todo o som do PC', subtitle: 'Menos o próprio Telinha, então não dá eco', choice: { kind: 'system' } }));
-    if (audioApps.length) {
+    const removed = audioApps.filter((a) => excludedNames.has(a.name)).map((a) => a.name);
+    const picked = chosenApps().map((a) => a.name);
+    items.push(audioOption({
+      key: 'system',
+      title: 'Todo o som do PC',
+      subtitle: removed.length ? `Menos o Telinha, ${removed.join(', ')}` : 'Menos o próprio Telinha, então não dá eco',
+      choice: { kind: 'system' },
+    }));
+    items.push(audioOption({
+      key: 'apps',
+      title: 'Só os apps que eu escolher',
+      subtitle: picked.length ? picked.join(' + ') : 'Marque um ou mais apps abaixo',
+      choice: { kind: 'apps' },
+    }));
+    items.push(audioOption({ key: 'none', title: 'Sem áudio', subtitle: 'Só a imagem', choice: { kind: 'none' } }));
+    if (audioChoice.kind === 'system' || audioChoice.kind === 'apps') {
+      const removing = audioChoice.kind === 'system';
       const group = document.createElement('div');
       group.className = 'options-group';
-      group.textContent = 'Só o som de um app';
+      group.textContent = removing ? 'Tirar do som' : 'Incluir no som';
       items.push(group);
-      for (const app of audioApps) {
-        items.push(audioOption({
-          key: `app-${app.pid}`,
-          title: app.name,
-          subtitle: `PID ${app.pid}`,
-          mono: true,
-          badge: app.active ? 'TOCANDO' : '',
-          choice: { kind: 'app', pid: app.pid },
-        }));
+      if (audioApps.length) {
+        for (const app of audioApps) items.push(appCheck(app, removing ? excludedNames : includedNames, removing));
+      } else {
+        const empty = document.createElement('div');
+        empty.className = 'options-empty';
+        empty.textContent = 'Nenhum app tocando som agora. Abra o jogo ou vídeo e clique em Atualizar.';
+        items.push(empty);
       }
-    } else {
-      const group = document.createElement('div');
-      group.className = 'options-group';
-      group.textContent = 'Nenhum app tocando som agora. Abra o jogo ou vídeo e clique em Atualizar apps.';
-      items.push(group);
     }
   } else {
     items.push(audioOption({ key: 'browser', title: 'Som do navegador', subtitle: 'Marque “Compartilhar áudio” na janela de escolha', choice: { kind: 'browser' } }));
+    items.push(audioOption({ key: 'none', title: 'Sem áudio', subtitle: 'Só a imagem', choice: { kind: 'none' } }));
   }
-  items.push(audioOption({ key: 'none', title: 'Sem áudio', subtitle: 'Só a imagem', choice: { kind: 'none' } }));
   box.replaceChildren(...items);
+  const submit = $('#shareSheet button[type=submit]');
+  const blocked = audioChoice.kind === 'apps' && chosenApps().length === 0;
+  submit.disabled = blocked;
+  submit.title = blocked ? 'Marque pelo menos um app' : '';
 }
 
 async function refreshAudioApps() {
@@ -547,7 +603,6 @@ async function refreshAudioApps() {
     audioApps = [];
     toast(`Não deu pra listar os apps: ${err}`);
   }
-  if (audioChoice.kind === 'app' && !audioApps.some((a) => a.pid === audioChoice.pid)) audioChoice = { kind: 'system' };
   renderAudioOptions();
 }
 
@@ -604,7 +659,10 @@ async function startShare() {
   let audioTracks = display.getAudioTracks();
   if (isNative && audioChoice.kind !== 'none') {
     try {
-      nativeAudio = await startNativeAudio(audioChoice.kind === 'app' ? { kind: 'app', pid: audioChoice.pid } : { kind: 'system' });
+      const source = audioChoice.kind === 'apps'
+        ? { kind: 'apps', pids: chosenApps().map((a) => a.pid) }
+        : { kind: 'system', exclude: audioApps.filter((a) => excludedNames.has(a.name)).map((a) => a.pid), excludeNames: [...excludedNames] };
+      nativeAudio = await startNativeAudio(source);
       audioTracks = [nativeAudio.track];
     } catch (err) {
       nativeAudio = null;
@@ -986,3 +1044,17 @@ function confirmLeave() {
 }
 
 hardwareCodecPrefs();
+
+let copyRoomTimer = 0;
+$('#copyRoom').addEventListener('click', async () => {
+  const btn = $('#copyRoom');
+  try {
+    await navigator.clipboard.writeText(roomId);
+    btn.classList.add('copied');
+    clearTimeout(copyRoomTimer);
+    copyRoomTimer = setTimeout(() => btn.classList.remove('copied'), 1600);
+    toast('Código da sala copiado', 2000);
+  } catch {
+    toast(`Código da sala: ${roomId}`, 6000);
+  }
+});
